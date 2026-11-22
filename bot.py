@@ -16,7 +16,10 @@ except Exception:  # pragma: no cover
     nav = None
 
 TAU = 2 * math.pi
-BUDGET_S = 0.022          # soft cap for the whole act() (the hard limit is 50 ms)
+BUDGET_S = 0.022
+RETREAT_HP = 0.42
+RECOVER_HP = 0.85
+PEEK = True             # duck while reloading, peek when armed (sim-only so far)
 
 UPGRADE_PRIORITY = [
     "armor", "plating", "nanites", "laser_charge", "laser_damage", "gun_rate", "gun_damage",
@@ -79,6 +82,8 @@ class Bot:
         self.attackers = {}      # id -> last time it damaged us
         self.enemy_seen = {}     # id -> (t, pos, vel)
         self.laser_hold_t = None
+        self.retreating = False
+        self.peek = None
         self.scan_yaw = None
         self.mode = ""
         self.last_aim = [0.0, 0.0]
@@ -216,6 +221,36 @@ class Bot:
             if best is not None:
                 return best
         return best
+
+    def find_peek(self, x, y, z, tc):
+        """Nearest walkable point with line of sight from our muzzle height to the target center."""
+        m = self.map
+        if m is None:
+            return None
+        my_s = m.surf_at(x, y)
+        t_end = time.perf_counter() + 0.005
+        for r in (4.0, 8.0, 13.0, 19.0, 26.0):
+            best = None
+            bd = 1e18
+            for k in range(12):
+                a = k * TAU / 12
+                px, py = x + r * math.cos(a), y + r * math.sin(a)
+                if not m.inside(px, py, 6.0):
+                    continue
+                s = m.surf_at(px, py)
+                if s - my_s > 1.2:
+                    continue
+                dd = math.hypot(px - tc[0], py - tc[1])
+                if dd >= bd:
+                    continue
+                if not self.walk_ok(x, y, math.cos(a), math.sin(a), r):
+                    continue
+                if m.los(px, py, s + 7.0, tc[0], tc[1], tc[2]):
+                    best = (px, py)
+                    bd = dd
+            if best is not None or time.perf_counter() > t_end:
+                return best
+        return None
 
     def intercept(self, src, tgt, vel, speed):
         """Point to aim at so a straight projectile at `speed` meets a target moving at `vel`."""
@@ -472,7 +507,16 @@ class Bot:
                     cube_goal = cb["pos"]
 
         recently_hit = t - self.last_damage_t < 3
-        retreat = target is not None and (hpf < 0.42 or (len([v for v in vis if v[3] and v[2] < 180]) >= 2 and hpf < 0.7))
+        n_los = len([v for v in vis if v[3] and v[2] < 180])
+        if hpf < RETREAT_HP or (n_los >= 2 and hpf < 0.7):
+            self.retreating = True
+        elif hpf > RECOVER_HP or (target is None and hpf > 0.6 and not recently_hit and t - self.last_damage_t > 12):
+            self.retreating = False
+        retreat = self.retreating and (target is not None or recently_hit or hpf < RECOVER_HP)
+        # while recovering, hold fire unless pressed: shooting resets the regen timer
+        if retreat and target is not None and not (t - self.last_damage_t < 2.5 or target[2] < 50):
+            if not laser_charging:
+                fire = [False, False]
         if need_zone:
             self.mode = "zone"
             dirv = self.flow.direction(x, y) if (self.flow is not None and self.flow.dist[self.map.ccell(x, y)] < 1e17) else None
@@ -513,16 +557,47 @@ class Bot:
                 lo, hi = 70, 170
             else:
                 lo, hi = 45, 120
-            radial = 0.0
-            if d > hi:
-                radial = 1.0
-            elif d < lo:
-                radial = -1.0
-            if not has_los:
-                radial = 0.4 if hpf > 0.7 else 0.0
-            px_, py_ = -uy * self.strafe_dir, ux * self.strafe_dir
-            move = [ux * radial + px_ * 0.9, uy * radial + py_ * 0.9]
-            boost = me["energy"] > 50 and d < 120
+            # can we hurt it right now?
+            gun_ready = gun is not None and (gun.get("ammo") or 0) > 0 and (gun.get("reload") or 0) <= 0
+            laser_ready = laser_i is not None and (weapons[laser_i].get("charge") or 0) >= weapons[laser_i]["stats"].get("charge", 0.75) - 0.1
+            light_ready = light_i is not None and d < 45 and me["energy"] > 10
+            armed = gun_ready or laser_ready or light_ready
+            if PEEK and not armed and has_los and d > 40:
+                # duck out of sight while reloading / charging
+                self.mode = "duck"
+                if t - self.cover_t > 0.5 or self.cover is None:
+                    self.cover = self.find_cover(x, y, z, threats, nxt)
+                    self.cover_t = t
+                if self.cover is not None:
+                    move = [self.cover[0] - x, self.cover[1] - y]
+                    if math.hypot(*move) < 1.5:
+                        move = [0.0, 0.0]
+                else:
+                    move = [-uy * self.strafe_dir - ux * 0.3, ux * self.strafe_dir - uy * 0.3]
+                boost = me["energy"] > 30
+            elif PEEK and not has_los:
+                self.mode = "peek"
+                if armed or hpf > 0.7:
+                    if t - getattr(self, "peek_t", -10) > 0.5:
+                        self.peek = self.find_peek(x, y, z, c)
+                        self.peek_t = t
+                    if self.peek is not None:
+                        move = [self.peek[0] - x, self.peek[1] - y]
+                    else:
+                        move = [ux * 0.6, uy * 0.6]
+                else:
+                    move = [0.0, 0.0]
+            else:
+                radial = 0.0
+                if d > hi:
+                    radial = 1.0
+                elif d < lo:
+                    radial = -1.0
+                if not has_los:
+                    radial = 0.4 if hpf > 0.7 else 0.0
+                px_, py_ = -uy * self.strafe_dir, ux * self.strafe_dir
+                move = [ux * radial + px_ * 0.9, uy * radial + py_ * 0.9]
+                boost = me["energy"] > 50 and d < 120
         elif want is not None:
             self.mode = "loot"
             move = [want["pos"][0] - x, want["pos"][1] - y]
@@ -597,10 +672,8 @@ class Bot:
 
         if aim is None:
             # face where we are going, or keep watching the threat direction
-            if mlen > 0.3:
-                aim = [math.atan2(move[1], move[0]), 0.0]
-            else:
-                aim = [my_aim[0] + 0.9, 0.0]  # idle scan
+            # sweep the view around us: 120 degree cone, so a full turn every few seconds
+            aim = [my_aim[0] + 0.6, 0.0]
         pmin, pmax = st.get("min_pitch", -0.7), st.get("max_pitch", 1.3)
         aim = [wrap(aim[0]), max(pmin, min(pmax, aim[1]))]
         act.update(move=[round(move[0], 3), round(move[1], 3)], aim=[round(aim[0], 4), round(aim[1], 4)],
